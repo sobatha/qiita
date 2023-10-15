@@ -1,0 +1,329 @@
+# はじめに
+vueのリアクティビティーがどのように実装されているかをソースコードを読みながら簡易版refを実装したので、実装とソースコードの中身についてまとめ。
+
+# vueにおけるrefの実装
+vue公式の[リアクティビティの探求](https://ja.vuejs.org/guide/extras/reactivity-in-depth.html#how-reactivity-works-in-vue)を読むと今回実装するrefの中身について以下のように記述があります。
+```js
+function ref(value) {
+  const refObject = {
+    get value() {
+      track(refObject, 'value')
+      return value
+    },
+    set value(newValue) {
+      value = newValue
+      trigger(refObject, 'value')
+    }
+  }
+  return refObject
+}
+
+let activeEffect
+
+function track(target, key) {
+  if (activeEffect) {
+    const effects = getSubscribersForProperty(target, key)
+    effects.add(activeEffect)
+  }
+}
+
+function trigger(target, key) {
+  const effects = getSubscribersForProperty(target, key)
+  effects.forEach((effect) => effect())
+}
+
+function whenDepsChange(update) {
+  const effect = () => {
+    activeEffect = effect
+    update()
+    activeEffect = null
+  }
+  effect()
+}
+```
+上記のコードのように、refのリアクティビテは、
+1. refの作成時受け取ったvalueにgetterとsetterをもつobjectでラップする
+2. getterにアクセスがあれば、アクセスした関数（effect：副作用）を記録しておく
+3. setterにアクセスが起き値の更新が行われたタイミングで、記録しておいた関数を全て実行する
+以上のようなメカニズムで実装されています。
+
+しかし、この簡略化され過ぎたrefではどのようにrefにアクセスがあった関数を記録しておくのかがよくわかりません。
+
+今回は[vueソースコード](https://github.com/vuejs/core/blob/2857a59e61c9955e15553180e7480aa40714151c/packages/reactivity/src/ref.ts)を読みつつ実装した簡易版（ドキュメントよりはちょっと実装が増えた）を実装しながら中身を探ってみます。
+
+
+## RefImplの実装
+
+それでは実際のコードを見つつ、そこからコアの部分だけを抜いてリアクティビティを実装してみましょう。
+まず、毎日お世話になっている`ref()`の実装から見てみます。
+```ts
+/**
+ * Takes an inner value and returns a reactive and mutable ref object, which
+ * has a single property `.value` that points to the inner value.
+ *
+ * @param value - The object to wrap in the ref.
+ * @see {@link https://vuejs.org/api/reactivity-core.html#ref}
+ */
+export function ref<T extends Ref>(value: T): T
+export function ref<T>(value: T): Ref<UnwrapRef<T>>
+export function ref<T = any>(): Ref<T | undefined>
+export function ref(value?: unknown) {
+  return createRef(value, false)
+}
+```
+`createRef`を読んで返しているだけですね。
+それでは同じファイルに実装がある`createRef`を読んでみます。
+
+```ts
+function createRef(rawValue: unknown, shallow: boolean) {
+  if (isRef(rawValue)) {
+    return rawValue
+  }
+  return new RefImpl(rawValue, shallow)
+}
+```
+受け取った値がrefであればそのまま返し、refでなければ`RefImpl`というclassのインスタンスを返しているようです。
+簡易版としてはshallowを無視して値を取って`RefImpl`インスタンスを返すことにします。
+```myref.ts
+function ref<T>(value: T) {
+    return new RefImpl(value);
+}
+```
+
+では`RefImpl` classのソースコードを見てみましょう。
+
+```ts
+class RefImpl<T> {
+  private _value: T
+  private _rawValue: T
+
+  public dep?: Dep = undefined
+  public readonly __v_isRef = true
+
+  constructor(
+    value: T,
+    public readonly __v_isShallow: boolean
+  ) {
+    this._rawValue = __v_isShallow ? value : toRaw(value)
+    this._value = __v_isShallow ? value : toReactive(value)
+  }
+
+  get value() {
+    trackRefValue(this)
+    return this._value
+  }
+
+  set value(newVal) {
+    const useDirectValue =
+      this.__v_isShallow || isShallow(newVal) || isReadonly(newVal)
+    newVal = useDirectValue ? newVal : toRaw(newVal)
+    if (hasChanged(newVal, this._rawValue)) {
+      this._rawValue = newVal
+      this._value = useDirectValue ? newVal : toReactive(newVal)
+      triggerRefValue(this, newVal)
+    }
+  }
+}
+```
+これがrefの本体で、console.logで任意のrefの中身を見てみると以下のようになっています。
+
+
+だいぶコードが長くなってしんどくなってきました。しかしvue公式のドキュメントにあるコードと本質的には同じで、getterとsetterでvalueをラップしています。vue公式からの追加で興味深いのは、depの存在です。これは何でしょう？
+
+```dep.ts
+export type Dep = Set<ReactiveEffect> & TrackedMarkers
+/**
+ * wasTracked and newTracked maintain the status for several levels of effect
+ * tracking recursion. One bit per level is used to define whether the dependency
+ * was/is tracked.
+ */
+type TrackedMarkers = {
+  /**
+   * wasTracked
+   */
+  w: number
+  /**
+   * newTracked
+   */
+  n: number
+}
+```
+depは`ReactiveEffect`のSetのようです。`ReactiveEffect`は最初の公式のドキュメントにも出てきましたが、
+
+> 依存関係を自動的に追跡し、依存関係が変更されるたびに再実行するエフェクト
+
+のことです。要するにrefを利用していて、refの値が変更されたときに副作用として実行する必要のある関数の集合です。
+一旦`ReactiveEffect`の実装は置いておいて、先にここまでの`Dep`、`RefImple`の簡易版を作ります。
+
+```myref.ts
+//DepはReactiveEffectのSet
+type Dep = Set<ReactiveEffect>;
+
+//Refの実装
+class RefImpl<T> {
+  //reactiveにしたい値を_valueに保持
+  private _value: T;
+  //このrefに依存しているeffectの集合
+  public dep: Dep = new Set();
+
+  constructor(value: T) {
+    this._value = value;
+  }
+
+  //.valueにgetterでアクセスするときに、activeEffectをdepに追加
+  get value() {
+    trackEffects(this.dep);
+    return this._value;
+  }
+
+  //.valueにsetterで値を更新するときに、depに登録したeffectを実行
+  set value(newVal) {
+    this._value = newVal;
+    triggerEffects(this.dep);
+  }
+}
+
+//activeEffectをdepに登録する
+function trackEffects(dep: Dep) {
+  if (activeEffect) dep.add(activeEffect);
+}
+
+//depの中のeffectを順番に実行
+function triggerEffects(dep: Dep) {
+  for (const effect of dep) {
+    effect.run();
+  }
+}
+```
+
+
+実際の`ReactiveEffect`のソースコードは以下の通りです（100行以上あるので、一部省略しています）。
+
+```effect.ts
+export let activeEffect: ReactiveEffect | undefined
+
+export class ReactiveEffect<T = any> {
+  active = true
+  deps: Dep[] = []
+  parent: ReactiveEffect | undefined = undefined
+
+  // 一部省略
+
+  constructor(
+    public fn: () => T,
+    public scheduler: EffectScheduler | null = null,
+    scope?: EffectScope
+  ) {
+    recordEffectScope(this, scope)
+  }
+
+  run() {
+    if (!this.active) {
+      return this.fn()
+    }
+    let parent: ReactiveEffect | undefined = activeEffect
+    let lastShouldTrack = shouldTrack
+    while (parent) {
+      if (parent === this) {
+        return
+      }
+      parent = parent.parent
+    }
+    try {
+      this.parent = activeEffect
+      activeEffect = this
+      shouldTrack = true
+
+      trackOpBit = 1 << ++effectTrackDepth
+
+      if (effectTrackDepth <= maxMarkerBits) {
+        initDepMarkers(this)
+      } else {
+        cleanupEffect(this)
+      }
+      return this.fn()
+    } finally {
+      if (effectTrackDepth <= maxMarkerBits) {
+        finalizeDepMarkers(this)
+      }
+
+      trackOpBit = 1 << --effectTrackDepth
+
+      activeEffect = this.parent
+      shouldTrack = lastShouldTrack
+      this.parent = undefined
+
+      if (this.deferStop) {
+        this.stop()
+      }
+    }
+  }
+
+  stop() {
+    // stopped while running itself - defer the cleanup
+    if (activeEffect === this) {
+      this.deferStop = true
+    } else if (this.active) {
+      cleanupEffect(this)
+      if (this.onStop) {
+        this.onStop()
+      }
+      this.active = false
+    }
+  }
+}
+
+function cleanupEffect(effect: ReactiveEffect) {
+  const { deps } = effect
+  if (deps.length) {
+    for (let i = 0; i < deps.length; i++) {
+      deps[i].delete(effect)
+    }
+    deps.length = 0
+  }
+}
+```
+ReactiveEffectのpropatyのメインの機能は以下の通り。
+* fn: 依存関係が変更されたときに実行される関数
+* parent: 依存している先の`ReactiveEffect`
+* run():　fnを実行しても問題ないか依存関係を確認し、acctiveEffectにfnを登録し、fn()を実行する
+
+それでは今まで読んだソースコードを踏まえて、ReactiveEffectの簡易版を書いてみます。
+```ts
+let activeEffect: ReactiveEffect | undefined;
+
+class ReactiveEffect<T = any> {
+  constructor(public fn: () => T) {
+  }
+  run() {
+    activeEffect = effect;
+    return this.fn();
+  }
+}
+
+function myWatchEffect(fn:()=>any):void {
+    const effect = new ReactiveEffect(fn)    
+    effect.run()
+    activeEffect = undefined;
+}
+```
+
+
+
+```ts
+const msg = ref<string>("hello!")
+
+myWatchEffect(()=>console.log("I am tracking ",msg.value))
+
+msg.value = "changed!"
+```
+
+# コード全文
+
+
+# まとめ
+
+
+
+# 参考
+
