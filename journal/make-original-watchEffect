@@ -41,10 +41,10 @@ function whenDepsChange(update) {
   effect()
 }
 ```
-上記のコードのように、refのリアクティビテは、
-1. refの作成時受け取ったvalueにgetterとsetterをもつobjectでラップする
+上記のコードのように、refのリアクティビティは、
+1. refの作成時、受け取ったvalueをgetterとsetterをもつobjectでラップする
 2. getterにアクセスがあれば、アクセスした関数（effect：副作用）を記録しておく
-3. setterにアクセスが起き値の更新が行われたタイミングで、記録しておいた関数を全て実行する
+3. setterにより値の更新が行われたタイミングで、記録しておいた関数（effect）を実行する
 以上のようなメカニズムで実装されています。
 
 しかし、この簡略化され過ぎたrefではどのようにrefにアクセスがあった関数を記録しておくのかがよくわかりません。
@@ -52,11 +52,12 @@ function whenDepsChange(update) {
 今回は[vueソースコード](https://github.com/vuejs/core/blob/2857a59e61c9955e15553180e7480aa40714151c/packages/reactivity/src/ref.ts)を読みつつ実装した簡易版（ドキュメントよりはちょっと実装が増えた）を実装しながら中身を探ってみます。
 
 
-## RefImplの実装
+# MyRefの実装
 
+## ref()
 それでは実際のコードを見つつ、そこからコアの部分だけを抜いてリアクティビティを実装してみましょう。
 まず、毎日お世話になっている`ref()`の実装から見てみます。
-```ts
+```ref.ts
 /**
  * Takes an inner value and returns a reactive and mutable ref object, which
  * has a single property `.value` that points to the inner value.
@@ -74,7 +75,7 @@ export function ref(value?: unknown) {
 `createRef`を読んで返しているだけですね。
 それでは同じファイルに実装がある`createRef`を読んでみます。
 
-```ts
+```ref.ts
 function createRef(rawValue: unknown, shallow: boolean) {
   if (isRef(rawValue)) {
     return rawValue
@@ -83,16 +84,19 @@ function createRef(rawValue: unknown, shallow: boolean) {
 }
 ```
 受け取った値がrefであればそのまま返し、refでなければ`RefImpl`というclassのインスタンスを返しているようです。
-簡易版としてはshallowを無視して値を取って`RefImpl`インスタンスを返すことにします。
+
+簡易版は値を受け取って`RefImpl`インスタンスを返すことにします。
 ```myref.ts
 function ref<T>(value: T) {
     return new RefImpl(value);
 }
 ```
 
+## RefImpl
 では`RefImpl` classのソースコードを見てみましょう。
 
-```ts
+
+```ref.ts
 class RefImpl<T> {
   private _value: T
   private _rawValue: T
@@ -126,9 +130,10 @@ class RefImpl<T> {
 }
 ```
 これがrefの本体で、console.logで任意のrefの中身を見てみると以下のようになっています。
+![スクリーンショット 2023-10-14 0.16.27.png](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/2724475/6fe0a8a1-ec8a-ef91-fc9c-3f7e041fa14f.png)
 
 
-だいぶコードが長くなってしんどくなってきました。しかしvue公式のドキュメントにあるコードと本質的には同じで、getterとsetterでvalueをラップしています。vue公式からの追加で興味深いのは、depの存在です。これは何でしょう？
+だいぶコードが長くなってしんどくなってきました。しかしvue公式のドキュメントにあるコードと本質的には同じで、getterとsetterでvalueをラップしています。vue公式からの違いで興味深いのは、depの存在です。これは何でしょう？
 
 ```dep.ts
 export type Dep = Set<ReactiveEffect> & TrackedMarkers
@@ -196,7 +201,7 @@ function triggerEffects(dep: Dep) {
 }
 ```
 
-
+## ReactiveEffect
 実際の`ReactiveEffect`のソースコードは以下の通りです（100行以上あるので、一部省略しています）。
 
 ```effect.ts
@@ -286,17 +291,17 @@ function cleanupEffect(effect: ReactiveEffect) {
 ReactiveEffectのpropatyのメインの機能は以下の通り。
 * fn: 依存関係が変更されたときに実行される関数
 * parent: 依存している先の`ReactiveEffect`
-* run():　fnを実行しても問題ないか依存関係を確認し、acctiveEffectにfnを登録し、fn()を実行する
+* run():　fnを実行しても問題ないか依存関係を確認し、実行できる・すべきである場合にacctiveEffectにthisを登録し、fn()を実行する。これにより、fn内でのrefへの　getterアクセスがあれば、this(activeEffect)がアクセスしたrefのdepに登録される。
 
-それでは今まで読んだソースコードを踏まえて、ReactiveEffectの簡易版を書いてみます。
-```ts
+それでは今まで読んだソースコードを踏まえて、ReactiveEffectの簡易版＋watchEffectを書いてみます。
+```myref.ts
 let activeEffect: ReactiveEffect | undefined;
 
 class ReactiveEffect<T = any> {
   constructor(public fn: () => T) {
   }
   run() {
-    activeEffect = effect;
+    activeEffect = this;
     return this.fn();
   }
 }
@@ -307,10 +312,70 @@ function myWatchEffect(fn:()=>any):void {
     activeEffect = undefined;
 }
 ```
-
-
+これでリアクティビティの実現に必要なアイテムは全て揃いました。実際にリアクティブが実装できているかどうか、以下のコードでテストしてみましょう。
 
 ```ts
+const msg = ref<string>("hello!")
+
+myWatchEffect(()=>console.log("I am tracking ",msg.value)) // I am tracking hello!
+
+msg.value = "changed!" // I am tracking changed!
+```
+`msg`変数の更新によってconsole.logが２回行われ、reactivityの実装ができていることが確かめられました！やったね👍
+# コード全文
+簡易版コード全文を掲載しておきます。
+```myref.ts
+type Dep = Set<ReactiveEffect>;
+let activeEffect: ReactiveEffect | undefined;
+
+class ReactiveEffect<T = any> {
+  constructor(public fn: () => T) {
+  }
+  run() {
+    activeEffect = this;
+    return this.fn();
+  }
+}
+
+function ref<T>(value: T) {
+    return new RefImpl(value);
+}
+
+class RefImpl<T> {
+  private _value: T;
+  public dep: Dep = new Set();
+
+  constructor(value: T) {
+    this._value = value;
+  }
+
+  get value() {
+    trackEffects(this.dep);
+    return this._value;
+  }
+
+  set value(newVal) {
+    this._value = newVal;
+    triggerEffects(this.dep);
+  }
+}
+
+function trackEffects(dep: Dep) {
+  if (activeEffect) dep.add(activeEffect);
+}
+
+function triggerEffects(dep: Dep) {
+  for (const effect of dep) {
+    effect.run();
+  }
+}
+
+function myWatchEffect(fn:()=>any):void {
+    const effect = new ReactiveEffect(fn)
+    effect.run()
+    activeEffect = undefined;
+}
+
 const msg = ref<string>("hello!")
 
 myWatchEffect(()=>console.log("I am tracking ",msg.value))
@@ -318,12 +383,11 @@ myWatchEffect(()=>console.log("I am tracking ",msg.value))
 msg.value = "changed!"
 ```
 
-# コード全文
-
-
 # まとめ
-
-
+実際にコードを読みつつ簡易版を実行することでvueにおけるrefの実装がどのようになっているのかを理解することができました。reactive、computedやwatchについても自力で簡易版を実装したいです。
 
 # 参考
+https://ja.vuejs.org/guide/extras/reactivity-in-depth.html#how-reactivity-works-in-vue
+
+https://www.vuemastery.com/courses/vue-3-reactivity/vue3-reactivity
 
